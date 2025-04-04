@@ -2,17 +2,14 @@ const { Client } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 const { MongoClient } = require('mongodb');
-const { addItem, getItems } = require('./menu_data'); // تغيير الاسم من menu إلى menu_data
+const { addItem, getItems } = require('./menu_data');
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
 const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017';
-const clientMongo = new MongoClient(mongoUri, {
-  reconnectTries: Number.MAX_VALUE,
-  reconnectInterval: 1000,
-});
+const clientMongo = new MongoClient(mongoUri); // إزالة الخيارات غير المدعومة
 let db;
 
 const client = new Client({
@@ -181,6 +178,7 @@ app.get('/responses', async (req, res) => {
 app.post('/add-response', async (req, res) => {
   const { keyword, response } = req.body;
   await db.collection('auto_responses').insertOne({ keyword, response });
+ W
   res.json({ message: 'Response added' });
 });
 
