@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:18.20.4-slim
 
 WORKDIR /app
 
@@ -7,11 +7,6 @@ RUN npm install
 
 COPY . .
 
-# تثبيت pm2 عالميًا وتأكد من أنه متاح في الـ PATH
-RUN npm install -g pm2 && \
-    ln -sf /usr/local/bin/pm2 /usr/bin/pm2 && \
-    ln -sf /usr/local/bin/pm2-runtime /usr/bin/pm2-runtime
-
 EXPOSE 10000
 
-CMD ["pm2-runtime", "server.js"]
+CMD ["node", "node_modules/pm2/bin/pm2-runtime", "server.js"]
