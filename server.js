@@ -2,7 +2,7 @@ const { Client } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 const { MongoClient } = require('mongodb');
-const { addItem, getItems } = require('./menu');
+const { addItem, getItems } = require('./menu_data'); // تغيير الاسم من menu إلى menu_data
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -87,13 +87,18 @@ app.get('/status', (req, res) => {
 app.post('/phone-auth', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
+
   try {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db.collection('otps').insertOne({ phone, otp, createdAt: new Date() });
-    console.log(`OTP for ${phone}: ${otp}`); // في الإنتاج، أرسل عبر SMS أو WhatsApp
-    res.json({ message: 'OTP sent' });
+
+    // إرسال رمز التحقق عبر WhatsApp
+    await client.sendMessage(`${phone}@c.us`, `رمز التحقق الخاص بك: ${otp}`);
+    res.json({ message: 'OTP sent via WhatsApp' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error sending OTP:', err);
+    res.status(500).json({ error: 'Failed to send OTP: ' + err.message });
   }
 });
 
