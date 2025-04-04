@@ -1,20 +1,26 @@
 const { Client } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
 const express = require('express');
-const WebSocket = require('ws');
-const http = require('http');
 const { MongoClient } = require('mongodb');
-
+const { addItem, getItems } = require('./menu');
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// رابط الاتصال بـ MongoDB
-const uri = 'mongodb+srv://manohack911:WUWWzhJZc1xmjkTM@cluster0.m2s0sjk.mongodb.net/whatsapp_bot?retryWrites=true&w=majority&appName=Cluster0';
-const clientMongo = new MongoClient(uri);
-
+const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017';
+const clientMongo = new MongoClient(mongoUri, {
+  reconnectTries: Number.MAX_VALUE,
+  reconnectInterval: 1000,
+});
 let db;
+
+const client = new Client({
+  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+});
+
+let qrCodeData = null;
+let isConnected = false;
 
 async function connectToMongo() {
   try {
@@ -27,83 +33,121 @@ async function connectToMongo() {
   }
 }
 
-connectToMongo();
-
-const client = new Client({
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium'
-  }
-});
-
 client.on('qr', (qr) => {
-  console.log('QR Code generated:', qr);
-  app.get('/qr', (req, res) => res.json({ qr }));
+  qrCodeData = qr;
+  qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', () => {
-  console.log('Bot is ready!');
-  app.get('/status', (req, res) => res.json({ status: 'connected' }));
-});
-
-client.on('disconnected', (reason) => {
-  console.log('Disconnected:', reason);
-  client.initialize();
-  app.get('/status', (req, res) => res.json({ status: 'disconnected' }));
+  isConnected = true;
+  qrCodeData = null;
+  console.log('Client is ready!');
 });
 
 client.on('message', async (msg) => {
-  const text = msg.body.toLowerCase();
-  let reply = null;
-
-  if (text.includes('المنيو') || text.includes('قائمة الطعام')) {
-    const items = await db.collection('menu').find().toArray();
-    reply = 'قائمة الطعام:\n';
-    items.forEach(item => {
-      reply += item.name + ' - ' + item.price + ' ريال\n';
-    });
-  }
-
-  const responses = await db.collection('responses').find().toArray();
-  for (const r of responses) {
-    if (text.includes(r.keyword.toLowerCase())) {
-      reply = r.response;
-      break;
+  const message = msg.body.toLowerCase();
+  if (message === 'المنيو' || message === 'قائمة الطعام') {
+    const items = await getItems();
+    let reply = 'قائمة الطعام:\n';
+    const MAX_LENGTH = 4000;
+    for (const item of items) {
+      const line = `${item.name} - ${item.price} ريال\n`;
+      if (reply.length + line.length > MAX_LENGTH) {
+        await msg.reply(reply);
+        reply = line;
+      } else {
+        reply += line;
+      }
     }
+    if (reply.length > 0) await msg.reply(reply);
+  } else {
+    const defaultResponse = await db.collection('default_responses').findOne({ key: 'default' });
+    await msg.reply(defaultResponse?.response || 'مرحبًا! أرسل "المنيو" لعرض قائمة الطعام.');
   }
+});
 
-  if (!reply) {
-    const defaultResponse = await db.collection('default_response').findOne({ key: 'default' });
-    reply = defaultResponse ? defaultResponse.response : 'عذرًا، ممكن توضح أكثر؟';
+client.initialize();
+connectToMongo();
+
+// API Endpoints
+app.get('/qr', (req, res) => {
+  if (qrCodeData) {
+    res.json({ qr: qrCodeData });
+  } else if (isConnected) {
+    res.json({ qr: null, message: 'Already connected' });
+  } else {
+    res.status(503).json({ error: 'QR code not generated yet' });
   }
+});
 
-  msg.reply(reply);
+app.get('/status', (req, res) => {
+  res.json({ connected: isConnected });
+});
 
-  wss.clients.forEach(client => client.send(JSON.stringify({ type: 'message', body: msg.body })));
+app.post('/phone-auth', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  try {
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await db.collection('otps').insertOne({ phone, otp, createdAt: new Date() });
+    console.log(`OTP for ${phone}: ${otp}`); // في الإنتاج، أرسل عبر SMS أو WhatsApp
+    res.json({ message: 'OTP sent' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/verify-otp', async (req, res) => {
+  const { phone, otp } = req.body;
+  try {
+    const record = await db.collection('otps').findOne({ phone, otp });
+    if (record) {
+      await db.collection('otps').deleteOne({ phone, otp });
+      isConnected = true;
+      qrCodeData = null;
+      res.json({ message: 'Verified and connected' });
+    } else {
+      res.status(400).json({ error: 'Invalid OTP' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/send', async (req, res) => {
-  const { to, message, mediaUrl, fileUrl } = req.body;
-  let status = 'sent';
+  const { to, message } = req.body;
+  if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
   try {
-    if (fileUrl) {
-      await client.sendMessage(to + '@c.us', { media: fileUrl, caption: message });
-    } else if (mediaUrl) {
-      await client.sendMessage(to + '@c.us', { media: mediaUrl });
-    } else {
-      await client.sendMessage(to + '@c.us', message);
-    }
-  } catch (e) {
-    status = 'failed';
-    console.error('Failed to send message:', e);
+    await client.sendMessage(`${to}@c.us`, message);
+    res.json({ message: 'Message sent' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  await db.collection('messages').insertOne({
-    text: message,
-    status: status,
-    timestamp: new Date().toISOString(),
-  });
-  res.send('Message sent');
+});
+
+app.get('/default-response', async (req, res) => {
+  const defaultResponse = await db.collection('default_responses').findOne({ key: 'default' });
+  res.json({ response: defaultResponse?.response || '' });
+});
+
+app.post('/default-response', async (req, res) => {
+  const { response } = req.body;
+  await db.collection('default_responses').updateOne(
+    { key: 'default' },
+    { $set: { response } },
+    { upsert: true }
+  );
+  res.json({ message: 'Default response updated' });
+});
+
+app.post('/add-item', async (req, res) => {
+  const { name, price, imagePath } = req.body;
+  try {
+    await addItem(name, price, imagePath);
+    res.json({ message: 'Item added' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/messages', async (req, res) => {
@@ -111,78 +155,36 @@ app.get('/messages', async (req, res) => {
   res.json(messages);
 });
 
+app.get('/groups', async (req, res) => {
+  try {
+    const chats = await client.getChats();
+    const groups = chats.filter(chat => chat.isGroup).map(group => ({
+      name: group.name,
+      memberCount: group.participants.length
+    }));
+    res.json(groups);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/responses', async (req, res) => {
-  const responses = await db.collection('responses').find().toArray();
+  const responses = await db.collection('auto_responses').find().toArray();
   res.json(responses);
 });
 
 app.post('/add-response', async (req, res) => {
   const { keyword, response } = req.body;
-  const responses = await db.collection('responses').find().toArray();
-  const id = responses.length > 0 ? responses[responses.length - 1].id + 1 : 1;
-  await db.collection('responses').insertOne({ id, keyword, response });
-  res.send('Response added');
+  await db.collection('auto_responses').insertOne({ keyword, response });
+  res.json({ message: 'Response added' });
 });
 
 app.delete('/delete-response/:id', async (req, res) => {
-  const id = parseInt(req.params.id);
-  await db.collection('responses').deleteOne({ id });
-  res.send('Response deleted');
+  const { id } = req.params;
+  await db.collection('auto_responses').deleteOne({ id: parseInt(id) });
+  res.json({ message: 'Response deleted' });
 });
 
-app.get('/default-response', async (req, res) => {
-  const defaultResponse = await db.collection('default_response').findOne({ key: 'default' });
-  res.json({ response: defaultResponse ? defaultResponse.response : null });
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
-
-app.post('/default-response', async (req, res) => {
-  const { response } = req.body;
-  await db.collection('default_response').updateOne(
-    { key: 'default' },
-    { $set: { response } },
-    { upsert: true }
-  );
-  res.send('Default response updated');
-});
-
-app.get('/groups', async (req, res) => {
-  try {
-    const chats = await client.getChats();
-    const groups = chats
-      .filter(chat => chat.isGroup)
-      .map(chat => ({
-        id: chat.id._serialized,
-        name: chat.name,
-        memberCount: chat.groupMetadata?.participants.length || 0,
-      }));
-    res.json(groups);
-  } catch (e) {
-    res.status(500).send('Error fetching groups');
-  }
-});
-
-app.get('/activation', (req, res) => {
-  res.json({ activationDate: '2025-06-28T10:59:00Z' });
-});
-
-app.post('/logout', (req, res) => {
-  client.logout();
-  res.send('Logged out');
-});
-
-app.post('/add-item', async (req, res) => {
-  const { name, price, imagePath } = req.body;
-  const items = await db.collection('menu').find().toArray();
-  const id = items.length > 0 ? items[items.length - 1].id + 1 : 1;
-  await db.collection('menu').insertOne({ id, name, price, imagePath });
-  res.send('Item added');
-});
-
-app.get('/menu-items', async (req, res) => {
-  const items = await db.collection('menu').find().toArray();
-  res.json(items);
-});
-
-client.initialize().catch(err => console.error('Failed to initialize WhatsApp client:', err));
-
-server.listen(process.env.PORT || 3000, () => console.log('Server running on port', process.env.PORT || 3000));
