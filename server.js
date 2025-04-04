@@ -9,11 +9,14 @@ const port = process.env.PORT || 3000;
 app.use(express.json());
 
 const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017';
-const clientMongo = new MongoClient(mongoUri); // إزالة الخيارات غير المدعومة
+const clientMongo = new MongoClient(mongoUri);
 let db;
 
 const client = new Client({
-  puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+  puppeteer: { 
+    headless: true, 
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--single-process', '--disable-gpu']
+  },
 });
 
 let qrCodeData = null;
@@ -26,12 +29,12 @@ async function connectToMongo() {
     console.log('Connected to MongoDB');
   } catch (err) {
     console.error('Failed to connect to MongoDB:', err);
-    process.exit(1);
   }
 }
 
 client.on('qr', (qr) => {
   qrCodeData = qr;
+  console.log('QR Code generated:', qr);
   qrcode.generate(qr, { small: true });
 });
 
@@ -41,9 +44,26 @@ client.on('ready', () => {
   console.log('Client is ready!');
 });
 
+client.on('disconnected', (reason) => {
+  isConnected = false;
+  console.log('Client disconnected:', reason);
+});
+
+client.on('auth_failure', (msg) => {
+  console.error('Authentication failure:', msg);
+});
+
+client.on('loading_screen', (percent, message) => {
+  console.log('Loading screen:', percent, message);
+});
+
 client.on('message', async (msg) => {
   const message = msg.body.toLowerCase();
   if (message === 'المنيو' || message === 'قائمة الطعام') {
+    if (!db) {
+      await msg.reply('فشل الاتصال بقاعدة البيانات، يرجى المحاولة لاحقًا.');
+      return;
+    }
     const items = await getItems();
     let reply = 'قائمة الطعام:\n';
     const MAX_LENGTH = 4000;
@@ -58,12 +78,18 @@ client.on('message', async (msg) => {
     }
     if (reply.length > 0) await msg.reply(reply);
   } else {
+    if (!db) {
+      await msg.reply('فشل الاتصال بقاعدة البيانات، يرجى المحاولة لاحقًا.');
+      return;
+    }
     const defaultResponse = await db.collection('default_responses').findOne({ key: 'default' });
     await msg.reply(defaultResponse?.response || 'مرحبًا! أرسل "المنيو" لعرض قائمة الطعام.');
   }
 });
 
-client.initialize();
+client.initialize().catch(err => {
+  console.error('Failed to initialize WhatsApp client:', err);
+});
 connectToMongo();
 
 // API Endpoints
@@ -87,6 +113,9 @@ app.post('/phone-auth', async (req, res) => {
   if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
 
   try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db.collection('otps').insertOne({ phone, otp, createdAt: new Date() });
 
@@ -102,6 +131,9 @@ app.post('/phone-auth', async (req, res) => {
 app.post('/verify-otp', async (req, res) => {
   const { phone, otp } = req.body;
   try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
     const record = await db.collection('otps').findOne({ phone, otp });
     if (record) {
       await db.collection('otps').deleteOne({ phone, otp });
@@ -128,12 +160,18 @@ app.post('/send', async (req, res) => {
 });
 
 app.get('/default-response', async (req, res) => {
+  if (!db) {
+    return res.status(503).json({ error: 'Database not connected' });
+  }
   const defaultResponse = await db.collection('default_responses').findOne({ key: 'default' });
   res.json({ response: defaultResponse?.response || '' });
 });
 
 app.post('/default-response', async (req, res) => {
   const { response } = req.body;
+  if (!db) {
+    return res.status(503).json({ error: 'Database not connected' });
+  }
   await db.collection('default_responses').updateOne(
     { key: 'default' },
     { $set: { response } },
@@ -145,6 +183,9 @@ app.post('/default-response', async (req, res) => {
 app.post('/add-item', async (req, res) => {
   const { name, price, imagePath } = req.body;
   try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
     await addItem(name, price, imagePath);
     res.json({ message: 'Item added' });
   } catch (err) {
@@ -153,6 +194,9 @@ app.post('/add-item', async (req, res) => {
 });
 
 app.get('/messages', async (req, res) => {
+  if (!db) {
+    return res.status(503).json({ error: 'Database not connected' });
+  }
   const messages = await db.collection('messages').find().toArray();
   res.json(messages);
 });
@@ -171,19 +215,27 @@ app.get('/groups', async (req, res) => {
 });
 
 app.get('/responses', async (req, res) => {
+  if (!db) {
+    return res.status(503).json({ error: 'Database not connected' });
+  }
   const responses = await db.collection('auto_responses').find().toArray();
   res.json(responses);
 });
 
 app.post('/add-response', async (req, res) => {
   const { keyword, response } = req.body;
+  if (!db) {
+    return res.status(503).json({ error: 'Database not connected' });
+  }
   await db.collection('auto_responses').insertOne({ keyword, response });
- W
   res.json({ message: 'Response added' });
 });
 
 app.delete('/delete-response/:id', async (req, res) => {
   const { id } = req.params;
+  if (!db) {
+    return res.status(503).json({ error: 'Database not connected' });
+  }
   await db.collection('auto_responses').deleteOne({ id: parseInt(id) });
   res.json({ message: 'Response deleted' });
 });
