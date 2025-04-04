@@ -1,18 +1,13 @@
 const { MongoClient } = require('mongodb');
 
 const uri = process.env.MONGO_URI || 'mongodb+srv://manohack911:WUWWzhJZc1xmjkTM@cluster0.m2s0sjk.mongodb.net/whatsapp_bot?retryWrites=true&w=majority&appName=Cluster0';
-const clientMongo = new MongoClient(uri, {
-  reconnectTries: Number.MAX_VALUE,
-  reconnectInterval: 1000,
-});
+const clientMongo = new MongoClient(uri); // إزالة الخيارات غير المدعومة
 
 let db;
 
 async function connectToMongo() {
   try {
-    if (!clientMongo.isConnected) {
-      await clientMongo.connect();
-    }
+    await clientMongo.connect();
     db = clientMongo.db('whatsapp_bot');
     console.log('Connected to MongoDB for menu');
   } catch (err) {
