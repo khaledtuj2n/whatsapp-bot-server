@@ -1,8 +1,8 @@
-const { Client } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const express = require('express');
 const { MongoClient } = require('mongodb');
 const { addItem, getItems } = require('./menu_data');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -12,15 +12,9 @@ const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017';
 const clientMongo = new MongoClient(mongoUri);
 let db;
 
-const client = new Client({
-  puppeteer: { 
-    headless: true, 
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--single-process', '--disable-gpu']
-  },
-});
-
 let qrCodeData = null;
 let isConnected = false;
+let sock;
 
 async function connectToMongo() {
   try {
@@ -32,64 +26,76 @@ async function connectToMongo() {
   }
 }
 
-client.on('qr', (qr) => {
-  qrCodeData = qr;
-  console.log('QR Code generated:', qr);
-  qrcode.generate(qr, { small: true });
-});
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+  });
 
-client.on('ready', () => {
-  isConnected = true;
-  qrCodeData = null;
-  console.log('Client is ready!');
-});
+  sock.ev.on('creds.update', saveCreds);
 
-client.on('disconnected', (reason) => {
-  isConnected = false;
-  console.log('Client disconnected:', reason);
-});
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-client.on('auth_failure', (msg) => {
-  console.error('Authentication failure:', msg);
-});
-
-client.on('loading_screen', (percent, message) => {
-  console.log('Loading screen:', percent, message);
-});
-
-client.on('message', async (msg) => {
-  const message = msg.body.toLowerCase();
-  if (message === 'المنيو' || message === 'قائمة الطعام') {
-    if (!db) {
-      await msg.reply('فشل الاتصال بقاعدة البيانات، يرجى المحاولة لاحقًا.');
-      return;
+    if (qr) {
+      qrCodeData = qr;
+      console.log('QR Code generated:', qr);
+      qrcode.generate(qr, { small: true });
     }
-    const items = await getItems();
-    let reply = 'قائمة الطعام:\n';
-    const MAX_LENGTH = 4000;
-    for (const item of items) {
-      const line = `${item.name} - ${item.price} ريال\n`;
-      if (reply.length + line.length > MAX_LENGTH) {
-        await msg.reply(reply);
-        reply = line;
-      } else {
-        reply += line;
+
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed:', lastDisconnect?.error, 'Reconnecting:', shouldReconnect);
+      if (shouldReconnect) {
+        connectToWhatsApp();
       }
+    } else if (connection === 'open') {
+      isConnected = true;
+      qrCodeData = null;
+      console.log('Client is ready!');
     }
-    if (reply.length > 0) await msg.reply(reply);
-  } else {
-    if (!db) {
-      await msg.reply('فشل الاتصال بقاعدة البيانات، يرجى المحاولة لاحقًا.');
-      return;
-    }
-    const defaultResponse = await db.collection('default_responses').findOne({ key: 'default' });
-    await msg.reply(defaultResponse?.response || 'مرحبًا! أرسل "المنيو" لعرض قائمة الطعام.');
-  }
-});
+  });
 
-client.initialize().catch(err => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message) return;
+
+    const message = msg.message.conversation?.toLowerCase();
+    if (message === 'المنيو' || message === 'قائمة الطعام') {
+      if (!db) {
+        await sock.sendMessage(msg.key.remoteJid, { text: 'فشل الاتصال بقاعدة البيانات، يرجى المحاولة لاحقًا.' });
+        return;
+      }
+      const items = await getItems();
+      let reply = 'قائمة الطعام:\n';
+      const MAX_LENGTH = 4000;
+      for (const item of items) {
+        const line = `${item.name} - ${item.price} ريال\n`;
+        if (reply.length + line.length > MAX_LENGTH) {
+          await sock.sendMessage(msg.key.remoteJid, { text: reply });
+          reply = line;
+        } else {
+          reply += line;
+        }
+      }
+      if (reply.length > 0) await sock.sendMessage(msg.key.remoteJid, { text: reply });
+    } else {
+      if (!db) {
+        await sock.sendMessage(msg.key.remoteJid, { text: 'فشل الاتصال بقاعدة البيانات، يرجى المحاولة لاحقًا.' });
+        return;
+      }
+      const defaultResponse = await db.collection('default_responses').findOne({ key: 'default' });
+      await sock.sendMessage(msg.key.remoteJid, { text: defaultResponse?.response || 'مرحبًا! أرسل "المنيو" لعرض قائمة الطعام.' });
+    }
+  });
+}
+
+connectToWhatsApp().catch(err => {
   console.error('Failed to initialize WhatsApp client:', err);
 });
+
 connectToMongo();
 
 // API Endpoints
@@ -119,8 +125,7 @@ app.post('/phone-auth', async (req, res) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db.collection('otps').insertOne({ phone, otp, createdAt: new Date() });
 
-    // إرسال رمز التحقق عبر WhatsApp
-    await client.sendMessage(`${phone}@c.us`, `رمز التحقق الخاص بك: ${otp}`);
+    await sock.sendMessage(`${phone}@c.us`, { text: `رمز التحقق الخاص بك: ${otp}` });
     res.json({ message: 'OTP sent via WhatsApp' });
   } catch (err) {
     console.error('Error sending OTP:', err);
@@ -152,7 +157,7 @@ app.post('/send', async (req, res) => {
   const { to, message } = req.body;
   if (!to || !message) return res.status(400).json({ error: 'Missing to or message' });
   try {
-    await client.sendMessage(`${to}@c.us`, message);
+    await sock.sendMessage(`${to}@c.us`, { text: message });
     res.json({ message: 'Message sent' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -203,9 +208,9 @@ app.get('/messages', async (req, res) => {
 
 app.get('/groups', async (req, res) => {
   try {
-    const chats = await client.getChats();
-    const groups = chats.filter(chat => chat.isGroup).map(group => ({
-      name: group.name,
+    const chats = await sock.groupFetchAllParticipating();
+    const groups = Object.values(chats).map(group => ({
+      name: group.subject,
       memberCount: group.participants.length
     }));
     res.json(groups);
