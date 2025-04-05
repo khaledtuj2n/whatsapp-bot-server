@@ -16,6 +16,9 @@ let qrCodeData = null;
 let isConnected = false;
 let sock;
 
+// Set لتتبع الرسائل المعالجة
+const processedMessages = new Set();
+
 async function connectToMongo() {
   try {
     await clientMongo.connect();
@@ -61,6 +64,18 @@ async function connectToWhatsApp() {
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
     if (!msg.message) return;
+
+    // التحقق من معرف الرسالة
+    const messageId = msg.key.id;
+    if (processedMessages.has(messageId)) return; // تجاهل الرسالة إذا تمت معالجتها
+
+    // إضافة معرف الرسالة إلى القائمة
+    processedMessages.add(messageId);
+
+    // تنظيف القائمة لتجنب التخزين المفرط
+    if (processedMessages.size > 1000) {
+      processedMessages.clear();
+    }
 
     const message = msg.message.conversation?.toLowerCase();
     if (message === 'المنيو' || message === 'قائمة الطعام') {
@@ -211,7 +226,8 @@ app.get('/groups', async (req, res) => {
     const chats = await sock.groupFetchAllParticipating();
     const groups = Object.values(chats).map(group => ({
       name: group.subject,
-      memberCount: group.participants.length
+      memberCount: group.participants.length,
+      participants: group.participants.map(participant => participant.id.split('@')[0])
     }));
     res.json(groups);
   } catch (err) {
