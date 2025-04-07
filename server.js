@@ -11,7 +11,7 @@ app.use(express.json());
 
 // إعداد WebSocket Server
 const wss = new WebSocket.Server({ port: 8080 });
-const sessions = new Map(); // لتخزين الجلسات بين التطبيق والمتصفح
+const sessions = new Map();
 
 // رابط MongoDB Atlas
 const mongoUri = process.env.MONGO_URI || 'mongodb+srv://manohack911:WUWWzhJZc1xmjkTM@cluster0.m2s0sjk.mongodb.net/whatsapp_bot?retryWrites=true&w=majority&appName=Cluster0';
@@ -42,11 +42,13 @@ async function connectToWhatsApp() {
     if (qr) {
       qrCodeData = qr;
       qrcode.generate(qr, { small: true });
-      console.log('QR Code generated');
+      console.log('QR Code generated:', qr);
     }
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('Connection closed:', lastDisconnect?.error, 'Reconnecting:', shouldReconnect);
+      isConnected = false;
+      qrCodeData = null;
       if (shouldReconnect) connectToWhatsApp();
     } else if (connection === 'open') {
       isConnected = true;
@@ -84,20 +86,14 @@ async function connectToWhatsApp() {
   });
 }
 
-// إعداد WebSocket لربط التطبيق بالمتصفح
 wss.on('connection', (ws) => {
   console.log('Client connected via WebSocket');
-
-  // إنشاء Session ID جديد
   const sessionId = uuidv4();
   sessions.set(sessionId, { ws, device: null });
-
-  // إرسال Session ID للمتصفح
   ws.send(JSON.stringify({ type: 'session', sessionId }));
 
   ws.on('message', async (message) => {
     const data = JSON.parse(message.toString());
-
     if (data.type === 'device_connected') {
       const session = sessions.get(data.sessionId);
       if (session) {
@@ -122,24 +118,21 @@ wss.on('connection', (ws) => {
 connectToMongo();
 connectToWhatsApp();
 
-// Endpoint لتوليد QR Code
 app.get('/qr', (req, res) => {
   if (qrCodeData) res.json({ qr: qrCodeData });
   else if (isConnected) res.json({ qr: null, message: 'Already connected' });
   else res.status(503).json({ error: 'QR code not generated yet' });
 });
 
-// Endpoint للتحقق من حالة الاتصال
 app.get('/status', (req, res) => res.json({ connected: isConnected }));
 
-// Endpoint لإرسال رسالة
 app.post('/send-message', async (req, res) => {
   const { chatId, message } = req.body;
   if (!chatId || !message) return res.status(400).json({ error: 'Missing chatId or message' });
   try {
     const sentCount = await db.collection('sent_messages').countDocuments({ chatId, date: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
     if (sentCount >= 5) return res.status(429).json({ error: 'Rate limit exceeded' });
-    await sock.sendMessage(`${chatId}@c.us`, { text: message });
+    await sock.sendMessage(`${chatId}@s.whatsapp.net`, { text: message });
     await db.collection('sent_messages').insertOne({ chatId, message, date: new Date() });
     res.json({ message: 'Message sent' });
   } catch (err) {
@@ -148,12 +141,11 @@ app.post('/send-message', async (req, res) => {
   }
 });
 
-// Endpoint لإرسال ملف
 app.post('/send-file', async (req, res) => {
   const { chatId, filePath } = req.body;
   if (!chatId || !filePath) return res.status(400).json({ error: 'Missing chatId or filePath' });
   try {
-    await sock.sendMessage(`${chatId}@c.us`, { document: { url: filePath }, mimetype: 'application/octet-stream' });
+    await sock.sendMessage(`${chatId}@s.whatsapp.net`, { document: { url: filePath }, mimetype: 'application/octet-stream' });
     res.json({ message: 'File sent' });
   } catch (err) {
     console.error('Error sending file:', err);
@@ -161,7 +153,6 @@ app.post('/send-file', async (req, res) => {
   }
 });
 
-// Endpoint لجدولة رسالة
 app.post('/schedule-message', async (req, res) => {
   const { chatId, message, scheduledTime } = req.body;
   if (!chatId || !message || !scheduledTime) return res.status(400).json({ error: 'Missing chatId, message, or scheduledTime' });
@@ -172,7 +163,7 @@ app.post('/schedule-message', async (req, res) => {
 
     const delay = scheduledDate.getTime() - now.getTime();
     setTimeout(async () => {
-      await sock.sendMessage(`${chatId}@c.us`, { text: message });
+      await sock.sendMessage(`${chatId}@s.whatsapp.net`, { text: message });
       await db.collection('sent_messages').insertOne({ chatId, message, date: new Date() });
     }, delay);
 
@@ -183,7 +174,6 @@ app.post('/schedule-message', async (req, res) => {
   }
 });
 
-// Endpoint لإعداد الرد التلقائي
 app.post('/set-auto-reply', async (req, res) => {
   const { keyword, response } = req.body;
   if (!keyword || !response) return res.status(400).json({ error: 'Missing keyword or response' });
@@ -200,12 +190,12 @@ app.post('/set-auto-reply', async (req, res) => {
   }
 });
 
-// Endpoint لجلب الشاتات
 app.get('/chats', async (req, res) => {
   try {
     if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
-    const chats = await sock.fetchChats();
-    const formattedChats = chats.map(chat => ({
+    // جلب الشاتات باستخدام sock.chats بدل fetchChats
+    const chats = sock.chats.all();
+    const formattedChats = Object.values(chats).map(chat => ({
       id: chat.id,
       name: chat.name || chat.id.split('@')[0],
       lastMessage: chat.lastMsg?.text || ''
@@ -217,7 +207,6 @@ app.get('/chats', async (req, res) => {
   }
 });
 
-// Endpoint لجلب الجروبات
 app.get('/groups', async (req, res) => {
   try {
     if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
@@ -228,7 +217,7 @@ app.get('/groups', async (req, res) => {
       members: group.participants.map(p => ({
         id: p.id,
         name: p.name || p.id.split('@')[0],
-        phone: p.id.split('@')[0]
+        phone: `+${p.id.split('@')[0]}`
       }))
     }));
     res.json(formattedGroups);
@@ -238,14 +227,13 @@ app.get('/groups', async (req, res) => {
   }
 });
 
-// Endpoint لجلب أرقام الأعضاء من الجروبات
 app.get('/group-numbers', async (req, res) => {
   try {
     if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
     const groups = await sock.groupFetchAllParticipating();
     const numbers = Object.values(groups).flatMap(group => group.participants.map(p => ({
       name: p.name || p.id.split('@')[0],
-      phone: p.id.split('@')[0]
+      phone: `+${p.id.split('@')[0]}`
     })));
     res.json(numbers);
   } catch (err) {
@@ -254,7 +242,6 @@ app.get('/group-numbers', async (req, res) => {
   }
 });
 
-// Endpoint لجلب الطلبات
 app.get('/orders', async (req, res) => {
   try {
     const orders = await db.collection('orders').find().toArray();
@@ -265,11 +252,10 @@ app.get('/orders', async (req, res) => {
   }
 });
 
-// Endpoint لتأكيد الطلب
 app.post('/confirm-order', async (req, res) => {
   const { cart } = req.body;
   try {
-    await db.collection('orders').insertOne({ cart, status: 'pending', date: new Date(), timestamp: new Date().toISOString() });
+    await db.collection('orders').insertOne({ cart, status: 'pending', date: new Date(), timestamp: new Date().toIsoString() });
     res.json({ message: 'Order confirmed' });
   } catch (err) {
     console.error('Error confirming order:', err);
@@ -277,15 +263,12 @@ app.post('/confirm-order', async (req, res) => {
   }
 });
 
-// Endpoint لإرسال رسائل جماعية
 app.post('/send-bulk-message', async (req, res) => {
-  const { message } = req.body;
-  if (!message) return res.status(400).json({ error: 'Missing message' });
+  const { message, numbers } = req.body;
+  if (!message || !numbers || !Array.isArray(numbers)) return res.status(400).json({ error: 'Missing message or numbers' });
   try {
-    const groups = await sock.groupFetchAllParticipating();
-    const groupIds = Object.keys(groups);
-    for (const groupId of groupIds) {
-      await sock.sendMessage(groupId, { text: message });
+    for (const number of numbers) {
+      await sock.sendMessage(`${number.replace('+', '')}@s.whatsapp.net`, { text: message });
     }
     res.json({ message: 'Bulk message sent' });
   } catch (err) {
