@@ -60,6 +60,20 @@ async function connectToWhatsApp() {
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
     if (!msg.message) return;
+
+    // تخزين الرسالة في MongoDB
+    try {
+      await db.collection('messages').insertOne({
+        chatId: msg.key.remoteJid,
+        message: msg.message.conversation || '',
+        fromMe: msg.key.fromMe,
+        timestamp: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString(),
+      });
+      console.log(`Message stored for chat ${msg.key.remoteJid}`);
+    } catch (err) {
+      console.error('Error storing message in MongoDB:', err);
+    }
+
     const message = msg.message.conversation?.toLowerCase();
     const responses = await db.collection('auto_responses').find().toArray();
     const match = responses.find(r => message.includes(r.keyword));
@@ -118,14 +132,17 @@ wss.on('connection', (ws) => {
 connectToMongo();
 connectToWhatsApp();
 
+// Endpoint لتوليد QR Code
 app.get('/qr', (req, res) => {
   if (qrCodeData) res.json({ qr: qrCodeData });
   else if (isConnected) res.json({ qr: null, message: 'Already connected' });
   else res.status(503).json({ error: 'QR code not generated yet' });
 });
 
+// Endpoint للتحقق من حالة الاتصال
 app.get('/status', (req, res) => res.json({ connected: isConnected }));
 
+// Endpoint لإرسال رسالة
 app.post('/send-message', async (req, res) => {
   const { chatId, message } = req.body;
   if (!chatId || !message) return res.status(400).json({ error: 'Missing chatId or message' });
@@ -133,6 +150,13 @@ app.post('/send-message', async (req, res) => {
     const sentCount = await db.collection('sent_messages').countDocuments({ chatId, date: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
     if (sentCount >= 5) return res.status(429).json({ error: 'Rate limit exceeded' });
     await sock.sendMessage(`${chatId}@s.whatsapp.net`, { text: message });
+    // تخزين الرسالة المرسلة في MongoDB
+    await db.collection('messages').insertOne({
+      chatId: chatId,
+      message: message,
+      fromMe: true,
+      timestamp: new Date().toISOString(),
+    });
     await db.collection('sent_messages').insertOne({ chatId, message, date: new Date() });
     res.json({ message: 'Message sent' });
   } catch (err) {
@@ -141,6 +165,7 @@ app.post('/send-message', async (req, res) => {
   }
 });
 
+// Endpoint لإرسال ملف
 app.post('/send-file', async (req, res) => {
   const { chatId, filePath } = req.body;
   if (!chatId || !filePath) return res.status(400).json({ error: 'Missing chatId or filePath' });
@@ -153,6 +178,7 @@ app.post('/send-file', async (req, res) => {
   }
 });
 
+// Endpoint لجدولة رسالة
 app.post('/schedule-message', async (req, res) => {
   const { chatId, message, scheduledTime } = req.body;
   if (!chatId || !message || !scheduledTime) return res.status(400).json({ error: 'Missing chatId, message, or scheduledTime' });
@@ -164,6 +190,13 @@ app.post('/schedule-message', async (req, res) => {
     const delay = scheduledDate.getTime() - now.getTime();
     setTimeout(async () => {
       await sock.sendMessage(`${chatId}@s.whatsapp.net`, { text: message });
+      // تخزين الرسالة المجدولة في MongoDB
+      await db.collection('messages').insertOne({
+        chatId: chatId,
+        message: message,
+        fromMe: true,
+        timestamp: new Date().toISOString(),
+      });
       await db.collection('sent_messages').insertOne({ chatId, message, date: new Date() });
     }, delay);
 
@@ -174,6 +207,7 @@ app.post('/schedule-message', async (req, res) => {
   }
 });
 
+// Endpoint لإعداد الرد التلقائي
 app.post('/set-auto-reply', async (req, res) => {
   const { keyword, response } = req.body;
   if (!keyword || !response) return res.status(400).json({ error: 'Missing keyword or response' });
@@ -190,10 +224,10 @@ app.post('/set-auto-reply', async (req, res) => {
   }
 });
 
+// Endpoint لجلب الشاتات
 app.get('/chats', async (req, res) => {
   try {
     if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
-    // جلب الشاتات باستخدام sock.chats بدل fetchChats
     const chats = sock.chats.all();
     const formattedChats = Object.values(chats).map(chat => ({
       id: chat.id,
@@ -207,6 +241,7 @@ app.get('/chats', async (req, res) => {
   }
 });
 
+// Endpoint لجلب الجروبات
 app.get('/groups', async (req, res) => {
   try {
     if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
@@ -227,6 +262,7 @@ app.get('/groups', async (req, res) => {
   }
 });
 
+// Endpoint لجلب أرقام الأعضاء من الجروبات
 app.get('/group-numbers', async (req, res) => {
   try {
     if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
@@ -242,6 +278,22 @@ app.get('/group-numbers', async (req, res) => {
   }
 });
 
+// Endpoint لجلب الرسائل الخاصة بشات معين
+app.get('/messages/:chatId', async (req, res) => {
+  const { chatId } = req.params;
+  try {
+    if (!isConnected) return res.status(503).json({ error: 'WhatsApp client not connected' });
+    
+    // جلب الرسائل من MongoDB
+    const messagesFromDb = await db.collection('messages').find({ chatId }).toArray();
+    res.json(messagesFromDb);
+  } catch (err) {
+    console.error('Error fetching messages:', err);
+    res.status(500).json({ error: 'Failed to fetch messages: ' + err.message });
+  }
+});
+
+// Endpoint لجلب الطلبات
 app.get('/orders', async (req, res) => {
   try {
     const orders = await db.collection('orders').find().toArray();
@@ -252,10 +304,11 @@ app.get('/orders', async (req, res) => {
   }
 });
 
+// Endpoint لتأكيد الطلب
 app.post('/confirm-order', async (req, res) => {
   const { cart } = req.body;
   try {
-    await db.collection('orders').insertOne({ cart, status: 'pending', date: new Date(), timestamp: new Date().toIsoString() });
+    await db.collection('orders').insertOne({ cart, status: 'pending', date: new Date(), timestamp: new Date().toISOString() });
     res.json({ message: 'Order confirmed' });
   } catch (err) {
     console.error('Error confirming order:', err);
@@ -263,12 +316,20 @@ app.post('/confirm-order', async (req, res) => {
   }
 });
 
+// Endpoint لإرسال رسائل جماعية
 app.post('/send-bulk-message', async (req, res) => {
   const { message, numbers } = req.body;
   if (!message || !numbers || !Array.isArray(numbers)) return res.status(400).json({ error: 'Missing message or numbers' });
   try {
     for (const number of numbers) {
       await sock.sendMessage(`${number.replace('+', '')}@s.whatsapp.net`, { text: message });
+      // تخزين الرسالة المرسلة في MongoDB
+      await db.collection('messages').insertOne({
+        chatId: `${number.replace('+', '')}@s.whatsapp.net`,
+        message: message,
+        fromMe: true,
+        timestamp: new Date().toISOString(),
+      });
     }
     res.json({ message: 'Bulk message sent' });
   } catch (err) {
